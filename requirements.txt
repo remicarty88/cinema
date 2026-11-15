@@ -6,3 +6,4 @@ curl_cffi>=0.7
 Flask-Compress>=1.15
 Pillow>=10.0
 segno>=1.6
+firebase-admin>=6.5
