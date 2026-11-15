@@ -3212,8 +3212,8 @@ const SOURCE = "hdrezka";
 const GENRES = ["Боевик","Комедия","Драма","Ужасы","Фантастика","Триллер","Мелодрама","Приключения","Детектив","Фэнтези","Мультфильм","Аниме","Сериал"];
 const state = { film:null, rows:[], featured:[], featIdx:0, lastView:"home", seasons:[], curSeason:null, curEp:null };
 let hls = null, dash = null;
-/* Внешний релей видеопотока: сервер отдаёт его адрес в /api/config. Задан —
-   видео идёт мимо Railway (egress ≈ 0); пусто — через серверный /api/proxy. */
+/* Внешний релей видеопотока: сервер отдаёт адрес в /api/config.
+   Видео запускается только через релей, без передачи потока через Railway. */
 let RELAY = "";
 let _cfgP = null;
 function loadConfig(){
@@ -4298,23 +4298,16 @@ function currentSources(){
   }
   return (f.sources || []).slice(0, 1);
 }
-/* подсказка серверу: какой транспорт нужен для потока (hdrezka — TLS-имперсонация,
-   kinogo — обычный requests), чтобы не тратить запрос на пробу при старте */
-function srcHint(){ return (state.film && state.film.source) || SOURCE; }
 /* origin плеера, к которому привязан поток: CDN пускает только с ним.
    Сервер кладёт его в источник (ref) — так он не зависит от памяти воркера. */
 function refQ(source){ return (source && source.ref) ? "&ref=" + encodeURIComponent(source.ref) : ""; }
-/* Адрес потока: через внешний релей (мимо Railway), если он задан, иначе через
-   наш /api/proxy. Релей переписывает плейлисты и добавляет Referer/Origin —
-   то же, что делает серверный прокси, но без egress Railway. Флаг sv=1 —
+/* Адрес потока — только через внешний релей, чтобы видео не шло через Railway.
+   Флаг sv=1 —
    потоки stravers: их CDN отвечает 403 без заголовков Authorizations/Accepts-Controls,
    которые добавляет релей (см. relay/worker.js). */
 function relayUrl(target, source){
   return RELAY + "/?url=" + encodeURIComponent(target) + refQ(source)
        + ((source && source.stravers) ? "&sv=1" : "");
-}
-function proxyUrl(kind, target, source){
-  return "/api/" + kind + "?url=" + encodeURIComponent(target) + "&src=" + srcHint() + refQ(source);
 }
 
 /* вход/выход из комнаты совместного просмотра меняет транспорт — перезапускаем */
@@ -4329,6 +4322,16 @@ new MutationObserver(() => {
 function startPlayback(){
   const src = currentSources()[0];
   if(src && (src.dash || src.hls || src.mp4)){
+    if(!RELAY){
+      stopPlayer();
+      $("player").classList.add("hidden");
+      $("videoEmpty").classList.remove("hidden");
+      $("videoEmpty").innerHTML = `<div><div class="big">😔</div>Видеорелей не настроен</div>`;
+      $("vLoad").classList.remove("on");
+      toast("Видеорелей не настроен. Чтобы не отправлять видео через Railway, воспроизведение остановлено.", "err");
+      preHide(true);
+      return;
+    }
     $("vLoad").classList.add("on");
     try{ k88Track("play", {u: state.url, t: String((state.film && state.film.name) || "").slice(0, 120), s: state.curSeason, e: state.curEp}); }catch(e){}
     playHls(src);
@@ -4488,15 +4491,14 @@ function prefAudioIndex(labels, fallback){
   const i = (labels || []).findIndex(l => String(l).trim() === p);
   return i >= 0 ? i : fallback;
 }
-function playDash(source, viaProxy){
+function playDash(source){
   const video = $("player");
-  const useRelay = !viaProxy && !!RELAY;      // релей — мимо Railway; /api/proxy — запасной
-  const url = useRelay ? relayUrl(source.dash, source) : proxyUrl("dash", source.dash, source);
+  const url = relayUrl(source.dash, source);
   dash = dashjs.MediaPlayer().create();
   const me = dash;                               // ссылка на этот инстанс для обработчиков
   dash.initialize(video, url, true);
   dash.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED, () => {
-    if(dash !== me) return;                        // это уже другой плеер (после фолбэка)
+    if(dash !== me) return;
     renderDashLevels();
     const names = source.audio || [];
     const tr = dashAudioTracks();
@@ -4518,14 +4520,12 @@ function playDash(source, viaProxy){
   });
   dash.on(dashjs.MediaPlayer.events.QUALITY_CHANGE_RENDERED, markDashLevel);
   dash.on(dashjs.MediaPlayer.events.ERROR, (e) => {
-    if(dash !== me) return;                      // событие от старого плеера — игнорируем
-    if(useRelay){                                // релей не осилил поток — пробуем /api/proxy
-      try{ me.reset(); }catch(_){}
-      dash = null;
-      playDash(source, true);
-      return;
-    }
-    if(e && e.error) toast("Ошибка потока: " + (e.error.code || e.error), "err");
+    if(dash !== me) return;
+    try{ me.reset(); }catch(_){}
+    dash = null;
+    $("vLoad").classList.remove("on");
+    if(e && e.error) toast("Ошибка видеорелея: " + (e.error.code || e.error), "err");
+    else toast("Видеорелей не смог загрузить поток", "err");
   });
 }
 
@@ -4553,17 +4553,17 @@ function libReadyFor(source){
   return true;
 }
 let _playWaitTimer = null, _playWaitT0 = 0, _pendingPlay = null;
-function playHls(source, viaProxy){
+function playHls(source){
   if(typeof window.MediaSource !== "undefined" && !libReadyFor(source)){
     if(window.ocLoadLib){ if(source.dash) ocLoadLib("dash"); if(source.hls) ocLoadLib("hls"); }
-    _pendingPlay = { source, viaProxy };
+    _pendingPlay = { source };
     if(!_playWaitTimer){
       _playWaitT0 = Date.now();
       _playWaitTimer = setInterval(() => {
         if(libReadyFor(_pendingPlay.source) || Date.now() - _playWaitT0 > 20000){
           clearInterval(_playWaitTimer); _playWaitTimer = null;
           const p = _pendingPlay; _pendingPlay = null;
-          if(p) playHls(p.source, p.viaProxy);
+          if(p) playHls(p.source);
         }
       }, 60);
     }
@@ -4578,7 +4578,7 @@ function playHls(source, viaProxy){
   // MSE есть в десктопных браузерах и Android; в iOS Safari его нет,
   // поэтому там DASH не запускаем и сразу идём в нативный HLS (потолок 720p).
   if(source.dash && window.dashjs && typeof window.MediaSource !== "undefined"){
-    playDash(source, viaProxy);
+    playDash(source);
     return;
   }
 
@@ -4587,10 +4587,7 @@ function playHls(source, viaProxy){
     $("videoEmpty").innerHTML = `<div><div class="big">😔</div>Поток не поддерживается этим браузером</div>`;
     return;
   }
-  /* по умолчанию — через релей (мимо Railway); после сбоя релея — через /api/proxy */
-  const useRelay = !viaProxy && !!RELAY;
-  const url = useRelay ? relayUrl(source.hls || source.mp4, source)
-                       : proxyUrl("proxy", source.hls || source.mp4, source);
+  const url = relayUrl(source.hls || source.mp4, source);
   if(source.hls && window.Hls && Hls.isSupported()){
     hls = new Hls({
       maxBufferLength: 60, maxBufferSize: 80 * 1000 * 1000, backBufferLength: 30,
@@ -4618,24 +4615,19 @@ function playHls(source, viaProxy){
     });
     hls.on(Hls.Events.LEVEL_SWITCHED, markLevel);
     hls.on(Hls.Events.ERROR, (e, d) => {
-      if(hls !== me) return;                        // событие от старого плеера — игнорируем
+      if(hls !== me) return;
       if(!d.fatal) return;
-      if(useRelay){                                 // релей не осилил — переключаемся на /api/proxy
-        try{ me.destroy(); }catch(_){}
-        hls = null;
-        playHls(source, true);
-        return;
-      }
       if(d.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
       else if(d.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
       else { toast("Ошибка потока: " + d.details, "err"); preHide(true); }
     });
   }else{
     $("qualityPills").innerHTML = `<span class="muted-s">авто</span>`;
-    if(useRelay) video.onerror = () => {            // нативный HLS/MP4: падение релея -> /api/proxy
+    video.onerror = () => {
       video.onerror = null;
-      video.src = proxyUrl("proxy", source.hls || source.mp4, source);
-      video.load(); video.play().catch(() => {});
+      $("vLoad").classList.remove("on");
+      toast("Видеорелей не смог загрузить поток. Резерв через Railway отключён.", "err");
+      preHide(true);
     };
     video.src = url; video.load(); video.play().catch(() => {});
   }
