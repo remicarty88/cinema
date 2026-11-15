@@ -3310,7 +3310,11 @@ function applyTopTone(){
 }
 function sampleHeroTone(src){
   try{
-    const im = new Image(); im.crossOrigin = "anonymous";
+    const imageUrl = new URL(src, location.href);
+    if(imageUrl.origin !== location.origin){
+      heroTone = null; applyTopTone(); return;
+    }
+    const im = new Image();
     im.onload = () => { try{
       const cv = document.createElement("canvas"); cv.width = 16; cv.height = 4;
       const x = cv.getContext("2d", {willReadFrequently:true});
@@ -3323,7 +3327,7 @@ function sampleHeroTone(src){
       applyTopTone();
     }catch(e){ heroTone = null; applyTopTone(); } };
     im.onerror = () => { heroTone = null; applyTopTone(); };
-    im.src = src;
+    im.src = imageUrl.href;
   }catch(e){}
 }
 window.addEventListener("scroll", updateHeader, {passive:true});
