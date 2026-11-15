@@ -3349,11 +3349,9 @@ function poster(u, w, h, wide){
   if(u.startsWith("//")) u = "https:" + u;
   /* постеры hdrezka закрыты Cloudflare — тянем через свой прокси */
   if(/hdrezka\./i.test(u)) return "/api/img?url=" + encodeURIComponent(u) + (w && h ? "&w=" + w + "&h=" + h : "");
-  /* TMDb отдаёт нужный размер сам, но тянем через свой /api/img:
-     service worker кэширует постеры (cache-first) — повторные загрузки мгновенные */
+  /* TMDb отдаёт нужный размер сам: загружаем напрямую, минуя Railway. */
   if(/image\.tmdb\.org/i.test(u))
-    return "/api/img?url=" + encodeURIComponent(
-      u.replace(/\/t\/p\/[^/]+\//i, "/t/p/" + (wide ? tmdbWideSize(w) : tmdbSize(w)) + "/"));
+    return u.replace(/\/t\/p\/[^/]+\//i, "/t/p/" + (wide ? tmdbWideSize(w) : tmdbSize(w)) + "/");
   if(!IMG_CDN || !/^https?:/i.test(u)) return u;
   return IMG_CDN + encodeURIComponent(u.replace(/^https?:\/\//i, "")) +
          "&w=" + w + "&h=" + h + "&fit=cover&output=webp&q=92&sharp=1&sharpf=spline";
@@ -4229,7 +4227,7 @@ function loadCast(f, ym){
     crew.innerHTML = crewTxt.join(""); crew.hidden = !crewTxt.length;
     if(!cast.length){ box.hidden = true; return; }
     $("fcRow").innerHTML = cast.map(c => {
-      const ph = c.photo ? "/api/img?url=" + encodeURIComponent(c.photo) : "";
+      const ph = c.photo ? esc(c.photo) : "";
       const ini = esc((c.name || "?").trim().charAt(0).toUpperCase());
       return `<div class="fc-p"><div class="fc-ph">${ph ? `<img src="${ph}" alt="" loading="lazy" decoding="async" onerror="this.remove()">` : ""}<b>${ini}</b></div>` +
              `<div class="fc-n">${esc(c.name)}</div>${c.role ? `<div class="fc-r">${esc(c.role)}</div>` : ""}</div>`;
