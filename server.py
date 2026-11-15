@@ -731,6 +731,13 @@ def _parse_movie_source(html):
             "audio": audio, "subtitles": subs}
 
 
+def _page_origin(url):
+    parsed = urlparse(url or "")
+    if not parsed.netloc:
+        return ""
+    return "%s://%s" % (parsed.scheme or "https", parsed.netloc)
+
+
 def _json_array(text, start):
     """Возвращает подстроку сбалансированного JSON-массива, начиная с '['."""
     depth, in_str, esc = 0, False, False
@@ -913,7 +920,8 @@ def _parse_balancer_player(iframe_url, html):
             if not got:
                 return None
             link, subs = got
-            source = {"title": v.get("title") or "Плеер", **_media_fields(link, subs)}
+            source = {"title": v.get("title") or "Плеер", "ref": origin,
+                      **_media_fields(link, subs)}
             return _with_quality(source, v.get("streamQuality") or v.get("quality"))
 
         out = []
@@ -949,6 +957,7 @@ def _parse_balancer_player(iframe_url, html):
                 order.append(so)
             num = e.get("order")
             seas[so].append({"episode": str(num if num is not None else len(seas[so])),
+                             "ref": origin,
                              **_media_fields(link, subs)})
     return [], [{"season": so, "episodes": seas[so]} for so in order if seas.get(so)]
 
@@ -1356,6 +1365,7 @@ def kinogo_film(url):
             if not html:
                 continue
             ok_players.append(p)
+            player_origin = _page_origin(p["url"])
             if "stravers" in p["url"] or _is_stravers_page(html):
                 # семейство stravers (домены ротируются) — потоки через /bnsi
                 ssrc, ssea = _parse_stravers_player(p["url"], html, referer=url)
@@ -1366,10 +1376,14 @@ def kinogo_film(url):
             src = _parse_movie_source(html)
             if src and (src.get("hls") or src.get("mp4") or src.get("dash")):
                 src["title"] = p["title"]
+                src["ref"] = player_origin
                 sources.append(src)
                 continue
             if not seasons:
                 seasons = _parse_serial_seasons(html)
+                for season in seasons:
+                    for episode in season.get("episodes") or []:
+                        episode["ref"] = player_origin
 
     # Экранки не показываем, если есть релиз получше; иначе оставляем как есть,
     # чтобы фильм не остался без потока. Из оставшихся — одна лучшая русская дорожка.
@@ -2183,6 +2197,7 @@ def hdrezka_film(url):
             if not ph:
                 continue
             ok_players.append(p)
+            player_origin = _page_origin(p["url"])
             if "stravers" in p["url"] or _is_stravers_page(ph):
                 # Сериал уже собран более дешёвым плеером (серии лежат в HTML
                 # массивом seasons). stravers отдаёт то же самое, но тянет поток
@@ -2199,9 +2214,13 @@ def hdrezka_film(url):
                 continue
             if not seasons:
                 seasons = _parse_serial_seasons(ph)
+                for season in seasons:
+                    for episode in season.get("episodes") or []:
+                        episode["ref"] = player_origin
             src = _parse_movie_source(ph)
             if src and (src.get("hls") or src.get("mp4") or src.get("dash")):
                 src["title"] = p["title"]
+                src["ref"] = player_origin
                 sources.append(src)
             elif "balancer-api/iframe" in p["url"] and not seasons:
                 # SPA-плеер семейства balancer-api (perepolokha, shortener2, …):
