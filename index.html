@@ -3082,7 +3082,7 @@ html.tv [tabindex]:focus,html.tv .card:focus,html.tv .ep:focus,html.tv .hn:focus
       <div class="cab-row">
         <button class="cab-room-new" id="cabCreateRoom"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>Комната</button>
         <form class="cab-join" id="cabJoinForm" autocomplete="off">
-          <input id="cabCode" placeholder="Код комнаты" maxlength="12">
+          <input id="cabCode" placeholder="16-символьный код комнаты" maxlength="16">
           <button type="submit" aria-label="Войти"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg></button>
         </form>
       </div>
@@ -3093,7 +3093,7 @@ html.tv [tabindex]:focus,html.tv .card:focus,html.tv .ep:focus,html.tv .hn:focus
       <div class="cab-row rc-cabrow">
         <button class="cab-room-new" id="cabRcShow" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18.5h2"/></svg>QR для телефона</button>
         <form class="cab-join" id="cabRcForm" autocomplete="off">
-          <input id="cabRcCode" placeholder="Код с экрана" maxlength="8" autocapitalize="characters" spellcheck="false">
+          <input id="cabRcCode" placeholder="24-символьный код с экрана" maxlength="24" autocapitalize="characters" spellcheck="false">
           <button type="submit" aria-label="Подключить пульт"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg></button>
         </form>
       </div>
@@ -3206,6 +3206,45 @@ html.tv [tabindex]:focus,html.tv .card:focus,html.tv .ep:focus,html.tv .hn:focus
 
 <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-database-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-auth-compat.js"></script>
+<script>
+window.__ocFirebaseAuthReady = (async function(){
+  const response = await fetch("/api/config", {cache:"no-store"});
+  const config = await response.json();
+  if(!response.ok || !config.firebaseApiKey || !config.firebaseDatabaseURL) throw new Error("Firebase Auth is not configured");
+  if(!firebase.apps.length) firebase.initializeApp({
+    apiKey: config.firebaseApiKey,
+    databaseURL: config.firebaseDatabaseURL
+  });
+  const auth = firebase.auth();
+  try{ await auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL); }catch(e){}
+  let user;
+  if(typeof auth.authStateReady === "function"){
+    await auth.authStateReady();
+    user = auth.currentUser;
+  }else{
+    user = await new Promise((resolve, reject) => {
+      let unsubscribe = null, settled = false;
+      const finish = (callback, value) => {
+        if(settled) return;
+        settled = true;
+        if(unsubscribe) unsubscribe();
+        callback(value);
+      };
+      unsubscribe = auth.onAuthStateChanged(
+        current => finish(resolve, current),
+        error => finish(reject, error)
+      );
+      if(settled && unsubscribe) unsubscribe();
+    });
+  }
+  if(!user) user = (await auth.signInAnonymously()).user;
+  return {auth: auth, user: user};
+})();
+window.__ocFirebaseAuthReady.catch(function(error){
+  console.warn("Firebase Auth is unavailable:", error);
+});
+</script>
 <script>
 const $ = id => document.getElementById(id);
 const SOURCE = "hdrezka";
@@ -5729,7 +5768,7 @@ buildGenres(); buildMoods(); loadHome(); updateHeader(); loadConfig();
   }catch(e){}
   /* адрес видео-релея нужен до старта воспроизведения, иначе поток пойдёт через
      Railway; конфиг — тот же сервер, поэтому задержка незаметна */
-  loadConfig().then(() => {
+  loadConfig().then(() => window.__ocFirebaseAuthReady.catch(() => null)).then(() => {
     if(u) openFilm(u, qp.get("s"), qp.get("e"));
     else if(last && last.u) openFilm(last.u, last.s, last.e);
   });
@@ -5738,25 +5777,33 @@ buildGenres(); buildMoods(); loadHome(); updateHeader(); loadConfig();
 
 <script>
 /* ================= Совместный просмотр + чат (Firebase Realtime Database) ================= */
-(function(){
-  if(!window.firebase){ console.warn("Firebase SDK не загрузился"); return; }
-  const RTDB_URL = "https://neonapp-a05b0-default-rtdb.firebaseio.com";
+(async function(){
+  const authCtx = await window.__ocFirebaseAuthReady;
+  if(!window.firebase || !authCtx || !authCtx.user){ console.warn("Firebase Auth не готов"); return; }
+  const auth = authCtx.auth, authUser = authCtx.user;
   let db, ROOT;
   try{
-    if(!firebase.apps.length) firebase.initializeApp({ databaseURL: RTDB_URL });
     db = firebase.database(); ROOT = db.ref("kino88");
   }catch(e){ console.warn("RTDB init:", e); return; }
 
   const el = id => document.getElementById(id);
 
-  /* ---------- профиль (без авторизации) ---------- */
+  /* ---------- профиль привязан к подтверждённому Firebase UID ---------- */
   const P = { uid:"", name:"" };
+  let pendingLegacyLogin = "";
   try{
-    P.uid = localStorage.getItem("k88:uid") || "";
-    if(!P.uid){
-      P.uid = (window.crypto && crypto.randomUUID) ? crypto.randomUUID()
-            : "u" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-      localStorage.setItem("k88:uid", P.uid);
+    P.uid = authUser.uid;
+    localStorage.setItem("k88:uid", P.uid);
+    const savedRoom = localStorage.getItem("k88:lastRoom") || "";
+    if(savedRoom && !/^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{16}$/.test(savedRoom)){
+      localStorage.removeItem("k88:lastRoom");
+    }
+    if(authUser.isAnonymous){
+      pendingLegacyLogin = localStorage.getItem("k88:legacyLogin") || localStorage.getItem("k88:login") || "";
+      if(pendingLegacyLogin){
+        localStorage.setItem("k88:legacyLogin", pendingLegacyLogin);
+        localStorage.removeItem("k88:login");
+      }
     }
     P.name = localStorage.getItem("k88:name") || "";
     P.av = localStorage.getItem("k88:ava");
@@ -5914,15 +5961,6 @@ buildGenres(); buildMoods(); loadHome(); updateHeader(); loadConfig();
 
   /* ================= аккаунт: логин + пароль (лёгкая регистрация) ================= */
   const getLogin = () => { try{ return localStorage.getItem("k88:login") || ""; }catch(e){ return ""; } };
-  const LOGIN_RE = /^[a-z0-9_-]{3,20}$/;
-  const b64e = u8 => btoa(String.fromCharCode.apply(null, u8));
-  const b64d = b => Uint8Array.from(atob(b), c => c.charCodeAt(0));
-  async function hashPw(pw, saltB64, it){
-    if(!(window.crypto && crypto.subtle)) throw new Error("nocrypto");
-    const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(pw), "PBKDF2", false, ["deriveBits"]);
-    const bits = await crypto.subtle.deriveBits({ name:"PBKDF2", salt:b64d(saltB64), iterations:it, hash:"SHA-256" }, key, 256);
-    return b64e(new Uint8Array(bits));
-  }
   let authMode = "reg", authBusy = false;
   function authSetMode(m){
     authMode = m;
@@ -5946,47 +5984,58 @@ buildGenres(); buildMoods(); loadHome(); updateHeader(); loadConfig();
     if(authBusy) return;
     const login = el("authLogin").value.trim().toLowerCase(), pw = el("authPass").value;
     const err = t => { el("authErr").textContent = t; };
-    if(!LOGIN_RE.test(login)) return err("Логин: 3–20 символов, латиница, цифры, _ или -");
+    if(!/^[a-z0-9_-]{3,20}$/.test(login)) return err("Логин: 3–20 символов, латиница, цифры, _ или -");
     if(pw.length < 6) return err("Пароль — минимум 6 символов");
     authBusy = true; el("authGo").disabled = true; err("");
     try{
-      const accRef = ROOT.child("accounts/" + login);
+      const headers = {"Content-Type":"application/json"};
       if(authMode === "reg"){
-        const salt = b64e(crypto.getRandomValues(new Uint8Array(16))), it = 150000;
-        const hash = await hashPw(pw, salt, it);
-        const res = await accRef.transaction(cur => cur ? undefined : { uid:P.uid, salt:salt, hash:hash, it:it, ts:now() });
-        if(!res.committed) return err("Этот логин уже занят");
-        try{ localStorage.setItem("k88:login", login); }catch(e){}
-        const upd = { login: login, ts: now() };
-        if(!P.name){ P.name = login; try{ localStorage.setItem("k88:name", login); }catch(e){} upd.name = login; }
-        ROOT.child("users/" + P.uid).update(upd);
-        startPresence();
-        paintMe(); renderCab(); closeAuth(); toast("Аккаунт создан: @" + login);
-      }else{
-        const snap = await accRef.once("value"), acc = snap.val();
-        const bad = "Неверный логин или пароль";
-        if(!acc) return err(bad);
-        const hash = await hashPw(pw, acc.salt, acc.it || 150000);
-        if(hash !== acc.hash) return err(bad);
-        const us = await ROOT.child("users/" + acc.uid + "/name").once("value");
-        try{
-          localStorage.setItem("k88:uid", acc.uid);
-          localStorage.setItem("k88:login", login);
-          if(us.val()) localStorage.setItem("k88:name", us.val());
-        }catch(e){}
-        location.reload();
+        const guest = auth.currentUser;
+        if(!guest || !guest.isAnonymous) return err("Обновите страницу и попробуйте снова");
+        headers.Authorization = "Bearer " + await guest.getIdToken();
       }
+      const response = await fetch("/api/auth/" + (authMode === "reg" ? "register" : "login"), {
+        method:"POST", credentials:"same-origin", cache:"no-store", headers:headers,
+        body:JSON.stringify({login:login, password:pw})
+      });
+      const result = await response.json().catch(() => ({}));
+      if(!response.ok || !result.ok) return err(result.error || "Не удалось войти");
+      const signed = await auth.signInWithCustomToken(result.token);
+      const uid = signed.user.uid;
+      let name = P.name || "";
+      if(authMode === "in"){
+        const snap = await ROOT.child("users/" + uid + "/name").once("value");
+        name = snap.val() || "";
+      }else if(!name){
+        name = login;
+      }
+      try{
+        localStorage.setItem("k88:uid", uid);
+        localStorage.setItem("k88:login", login);
+        localStorage.removeItem("k88:legacyLogin");
+        if(name) localStorage.setItem("k88:name", name);
+      }catch(e){}
+      if(authMode === "reg"){
+        const upd = {login:login, ts:now()};
+        if(!P.name){ P.name = name; upd.name = name; }
+        await ROOT.child("users/" + uid).update(upd);
+      }
+      location.reload();
     }catch(e){
-      err(e && e.message === "nocrypto" ? "Браузер не поддерживает безопасный вход (нужен https)" : "Нет связи с сервером, попробуйте ещё раз");
+      err(e && e.message ? e.message : "Нет связи с сервером, попробуйте ещё раз");
     }finally{
       authBusy = false; el("authGo").disabled = false;
     }
   }
   el("authGo").onclick = doAuth;
+  if(pendingLegacyLogin){
+    el("authLogin").value = pendingLegacyLogin;
+    setTimeout(() => openAuth("in"), 250);
+  }
   el("cabOut").onclick = () => {
     if(!confirm("Выйти из аккаунта @" + getLogin() + "? Данные останутся в аккаунте.")) return;
-    try{ ["k88:login","k88:uid","k88:name"].forEach(k => localStorage.removeItem(k)); }catch(e){}
-    location.reload();
+    try{ ["k88:login","k88:legacyLogin","k88:uid","k88:name"].forEach(k => localStorage.removeItem(k)); }catch(e){}
+    auth.signOut().finally(() => location.reload());
   };
 
   /* ---------- комнаты из профиля ---------- */
@@ -6154,6 +6203,14 @@ buildGenres(); buildMoods(); loadHome(); updateHeader(); loadConfig();
     ref.on("value", s => {
       const d = s.val() || {};
       userHist = d.history || {}; userBase = d.baseT || 0;
+    if(!authUser.isAnonymous && d.login){
+      try{ localStorage.setItem("k88:login", d.login); }catch(e){}
+    }
+    if(!P.name && d.name){
+      P.name = d.name;
+      try{ localStorage.setItem("k88:name", P.name); }catch(e){}
+      paintMe();
+    }
       if(d.createdAt){ userCreated = d.createdAt; }
       else{ userCreated = now(); try{ ref.update({ createdAt: userCreated }); }catch(e){} }
       if(el("cabBg").classList.contains("show")) renderCab();
@@ -6248,7 +6305,12 @@ buildGenres(); buildMoods(); loadHome(); updateHeader(); loadConfig();
   }
 
   /* ---------- комната ---------- */
-  const rndId = () => Math.random().toString(36).slice(2, 8).toUpperCase();
+  const ROOM_ALPH = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+  const rndId = () => {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, b => ROOM_ALPH[b % ROOM_ALPH.length]).join("");
+  };
   const inviteUrl = () => location.origin + location.pathname + "?room=" + roomId;
 
 
@@ -6366,7 +6428,7 @@ buildGenres(); buildMoods(); loadHome(); updateHeader(); loadConfig();
 
   function createRoom(){
     const id = rndId();
-    ROOT.child("rooms/" + id).set({ createdAt: now(), host: P.uid, ctl: "host" })
+    ROOT.child("rooms/" + id + "/meta").set({ createdAt: now(), host: P.uid, ctl: "host" })
       .then(() => { try{ k88Track("room_create", {}); }catch(e){} Promise.resolve(joinRoom(id)).then(() => { if(roomActive && roomId === id) showTour(); }); })
       .catch(e => toast("Не удалось создать комнату: " + e.message, "err"));
   }
@@ -6375,12 +6437,15 @@ buildGenres(); buildMoods(); loadHome(); updateHeader(); loadConfig();
     if(!P.name) return needName(() => joinRoom(id));
     const rid = String(id || "").trim().toUpperCase();
     if(!rid) return;
+    if(!/^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{16}$/.test(rid)){
+      toast("Неверный код комнаты: нужен новый 16-символьный код", "err"); return;
+    }
     if(roomActive && roomId === rid) return openDrawer();
     leaveRoom(true);
 
     roomId = rid;
     let data = null;
-    try{ data = (await R().once("value")).val(); }catch(e){ toast("Комната недоступна", "err"); return; }
+    try{ data = (await ROOT.child("rooms/" + rid + "/meta").once("value")).val(); }catch(e){ toast("Комната недоступна", "err"); roomId = null; return; }
     if(!data){ toast("Комната не найдена: " + rid, "err"); roomId = null; return; }
 
     hostUid = data.host || null; ctlMode = data.ctl || "host";
@@ -6396,21 +6461,21 @@ buildGenres(); buildMoods(); loadHome(); updateHeader(); loadConfig();
        комнаты. Раньше мы объявляли себя один раз при входе, поэтому после обрыва
        человек навсегда «пропадал» из комнаты. Теперь объявляемся заново при
        каждом восстановлении связи и заодно возвращаем статус микрофона. */
-    const announce = () => {
+    const announce = async () => {
       if(!roomActive) return;
       try{ meRef.onDisconnect().remove(); }catch(e){}
-      meRef.set({ name: P.name, av: avaIdx(P.uid, P.av), ts: now() });
+      await meRef.set({ name: P.name, av: avaIdx(P.uid, P.av), ts: now() });
       if(micOn){
         const vr = R("voice/" + P.uid);
         try{ vr.onDisconnect().remove(); }catch(e){}
-        vr.set({ mic: true, name: P.name, ts: now() });
+        await vr.set({ mic: true, name: P.name, ts: now() });
       }
     };
-    announce();
-    on(db.ref(".info/connected"), "value", s => { if(s.val() === true) announce(); });
+    try{ await announce(); }catch(e){ roomActive = false; roomId = null; toast("Не удалось войти в комнату", "err"); return; }
+    on(db.ref(".info/connected"), "value", s => { if(s.val() === true) announce().catch(() => {}); });
 
     on(R("members"), "value", s => { members = s.val() || {}; renderMembers(); paintChip(); vSync(); });
-    on(R("ctl"), "value", s => { ctlMode = s.val() || "host"; renderActions(); });
+    on(R("meta/ctl"), "value", s => { ctlMode = s.val() || "host"; renderActions(); });
     on(R("film"), "value", s => { const f = s.val(); if(f && f.url) openFilmShared(f.url); });
     on(R("play"), "value", s => { const d = s.val(); if(!d) return; lastPlay = d; applyPlay(d); });
 
@@ -6419,10 +6484,11 @@ buildGenres(); buildMoods(); loadHome(); updateHeader(); loadConfig();
     setTimeout(() => chatEmpty(true), 300);
 
     /* я хост и у меня уже открыт фильм, а в комнате его нет — публикую его в комнату */
-    if(!(data.film && data.film.url) && canControl() && state.url){ bcFilm(); bc(); }
+    const sharedFilm = (await R("film").once("value")).val();
+    if(!(sharedFilm && sharedFilm.url) && canControl() && state.url){ bcFilm(); bc(); }
 
     /* вхожу в комнату с фильмом — «перехожу» к нему */
-    if(data.film && data.film.url) await openFilmShared(data.film.url);
+    if(sharedFilm && sharedFilm.url) await openFilmShared(sharedFilm.url);
     if(lastPlay) applyPlay(lastPlay);
     hbTimer = setInterval(heartbeat, 5000);
     vAttach();
@@ -6627,7 +6693,7 @@ buildGenres(); buildMoods(); loadHome(); updateHeader(); loadConfig();
     tile(ICO.link, "Пригласить", "Скопировать ссылку", "", () => copyText(inviteUrl(), "Ссылка скопирована"));
     if(canControl()) tile(ICO.ctl, "Управление", ctlMode === "all" ? "Сейчас: все участники" : "Сейчас: только вы", "", () => {
       const v = ctlMode === "all" ? "host" : "all";
-      R("ctl").set(v);
+      R("meta/ctl").set(v);
       toast(v === "all" ? "Управлять могут все" : "Управляет только хост");
     });
     tile(ICO.help, "Подсказка", "Как всё работает", canControl() ? "" : "wide", () => { closeDrawer(); showTour(); });
@@ -6878,7 +6944,7 @@ buildGenres(); buildMoods(); loadHome(); updateHeader(); loadConfig();
     if(!rid) return;
     needName(() => joinRoom(rid));
   })();
-})();
+})().catch(error => console.warn("Firebase features did not start:", error));
 </script>
 <script>
 /* ================= Пульт: телефон управляет экраном (Firebase Realtime Database) =================
@@ -6893,8 +6959,9 @@ buildGenres(); buildMoods(); loadHome(); updateHeader(); loadConfig();
      cmds     {<push>:{c,...}}    — очередь команд телефон → экран (экран сразу удаляет обработанные)
      film     {url,title,...}     — что открыто на экране (+ список серий)
      pos      {p,t,d,vol,m,ts}    — позиция воспроизведения (телефон досчитывает время сам) */
-(function(){
-  if(!window.firebase) return;
+(async function(){
+  const authCtx = await window.__ocFirebaseAuthReady;
+  if(!window.firebase || !authCtx || !authCtx.user) return;
   var db, ROOT, TS;
   try{
     db = firebase.database();
@@ -6908,8 +6975,8 @@ buildGenres(); buildMoods(); loadHome(); updateHeader(); loadConfig();
   var lsGet = function(k){ try{ return localStorage.getItem(k) || ""; }catch(e){ return ""; } };
   var lsSet = function(k, v){ try{ if(v) localStorage.setItem(k, v); else localStorage.removeItem(k); }catch(e){} };
 
-  var uid = lsGet("k88:uid");
-  if(!uid){ uid = "u" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); lsSet("k88:uid", uid); }
+  var uid = authCtx.user.uid;
+  lsSet("k88:uid", uid);
 
   var off = 0;
   try{ db.ref(".info/serverTimeOffset").on("value", function(s){ off = s.val() || 0; }); }catch(e){}
@@ -6917,15 +6984,16 @@ buildGenres(); buildMoods(); loadHome(); updateHeader(); loadConfig();
 
   var ALPH = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";          // без похожих символов: 0/O, 1/I/L
   function newCode(){
-    var a = new Uint32Array(6), out = "";
-    try{ crypto.getRandomValues(a); }catch(e){ for(var i = 0; i < 6; i++) a[i] = Math.floor(Math.random() * 4e9); }
-    for(var j = 0; j < 6; j++) out += ALPH[a[j] % ALPH.length];
+    var a = new Uint8Array(24), out = "";
+    crypto.getRandomValues(a);
+    for(var j = 0; j < a.length; j++) out += ALPH[a[j] % ALPH.length];
     return out;
   }
   function normCode(s){
     s = String(s || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
-    return /^[A-Z0-9]{6}$/.test(s) ? s : "";
+    return /^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{24}$/.test(s) ? s : "";
   }
+  if(lsGet("k88:rcPhone") && !normCode(lsGet("k88:rcPhone"))) lsSet("k88:rcPhone", "");
   function fmt(t){
     t = Math.max(0, Math.floor(t || 0));
     var h = Math.floor(t / 3600), m = Math.floor(t % 3600 / 60), s = t % 60;
@@ -7316,7 +7384,7 @@ buildGenres(); buildMoods(); loadHome(); updateHeader(); loadConfig();
 
   function phoneJoin(code, silent){
     code = normCode(code);
-    if(!code){ if(!silent) toast("Код — 6 символов, например K7M2QX", "err"); return; }
+    if(!code){ if(!silent) toast("Введите актуальную 24-символьную ссылку с экрана", "err"); return; }
     if(S.on && S.code === code){ if(!silent) toast("Это код самого экрана — введите его на телефоне", "err"); return; }
     if(P.on && P.code === code){ if(!silent) openSheet(); return; }
     ROOT.child(code + "/screen").once("value").then(function(s){
@@ -7580,7 +7648,7 @@ buildGenres(); buildMoods(); loadHome(); updateHeader(); loadConfig();
 
   paintStatus();
   window.k88Remote = { showQr: showOverlay, join: function(c){ phoneJoin(c, false); } };
-})();
+})().catch(error => console.warn("Firebase remote control did not start:", error));
 </script>
 <script>
 /* PWA: устанавливаемое приложение + офлайн-фолбэк главной */

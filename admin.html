@@ -522,6 +522,7 @@ a.tag{text-decoration:none}
 
 <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-database-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-auth-compat.js"></script>
 <script>window.ADMIN_CFG = __ADMIN_CFG__;</script>
 <script>
 (function(){
@@ -610,13 +611,15 @@ const dispName = d => d.name || (d.login ? "@" + d.login : "Гость " + d.uid
 
 function deriveRoom(id, r){
   r = r && typeof r === "object" ? r : {};
+  const meta = r.meta && typeof r.meta === "object" ? r.meta : {};
+  const hostUid = meta.host || r.host;
   const m = r.members && typeof r.members === "object" ? r.members : {};
   const members = Object.keys(m).map(uid => Object.assign({uid: uid}, m[uid]));
-  const host = S.users[r.host];
+  const host = S.users[hostUid];
   return {id: id, r: r, members: members, msgs: r.messages ? Object.keys(r.messages).length : 0,
-          hostName: (host && host.name) || (r.host ? "Гость " + String(r.host).slice(0, 4) : "—"),
-          film: r.film && typeof r.film === "object" ? r.film : null, created: +r.createdAt || 0,
-          active: members.length > 0, ctl: r.ctl === "all" ? "all" : "host"};
+          hostName: (host && host.name) || (hostUid ? "Гость " + String(hostUid).slice(0, 4) : "—"),
+          film: r.film && typeof r.film === "object" ? r.film : null, created: +meta.createdAt || +r.createdAt || 0,
+          active: members.length > 0, ctl: (meta.ctl || r.ctl) === "all" ? "all" : "host"};
 }
 
 /* ---------- уведомления и окна ---------- */
@@ -696,10 +699,17 @@ function listen(name){
   ref.on("child_removed", s => { delete S[name][s.key]; bump(); }, fail);
   ref.once("value").then(() => { S.ready[name] = true; bump(); }, fail);
 }
-function attach(){
+async function attach(){
   if(!window.firebase){ showBanner("Не загрузился Firebase SDK (gstatic.com). Проверьте соединение и обновите страницу."); paintConn(); return; }
   try{
-    if(!firebase.apps.length) firebase.initializeApp({databaseURL: CFG.url});
+    if(!CFG.apiKey) throw new Error("Firebase Web API key не задан");
+    if(!firebase.apps.length) firebase.initializeApp({apiKey:CFG.apiKey, databaseURL:CFG.url});
+    const auth = firebase.auth();
+    await auth.setPersistence(firebase.auth.Auth.Persistence.NONE);
+    const tokenResponse = await fetch("/admin/firebase-token", {credentials:"same-origin", cache:"no-store"});
+    const tokenData = await tokenResponse.json().catch(() => ({}));
+    if(!tokenResponse.ok || !tokenData.token) throw new Error(tokenData.error || "Не удалось получить доступ админа к Firebase");
+    await auth.signInWithCustomToken(tokenData.token);
     const db = firebase.database(); ROOT = db.ref(CFG.root || "kino88");
     db.ref(".info/connected").on("value", s => { S.connected = s.val() === true; paintConn(); });
     db.ref(".info/serverTimeOffset").on("value", s => { S.off = s.val() || 0; });
@@ -1070,8 +1080,7 @@ function renderRoomMeta(){
     `<dt>Управление плеером</dt><dd><span class="seg" id="rdCtl"><button data-ctl="host" class="${r.ctl === "host" ? "on" : ""}">Хозяин</button><button data-ctl="all" class="${r.ctl === "all" ? "on" : ""}">Все</button></span></dd>` +
     `<dt>Сообщений</dt><dd>${nf(r.msgs)}</dd>`;
   $("#rdMembers").innerHTML = r.members.length ? r.members.map(m =>
-    `<li>${ava(m.uid, m.av, 30, m.name)}<div class="t"><b>${esc(m.name || "Гость")}</b><small>${m.uid === (r.r.host || "") ? "хозяин, " : ""}вошёл ${esc(ago(m.ts))}${r.r.voice && r.r.voice[m.uid] ? ", в голосовом" : ""}</small></div></li>`).join("")
-    : `<li class="empty">Никого нет.</li>`;
+`<li>${ava(m.uid, m.av, 30, m.name)}<div class="t"><b>${esc(m.name || "Гость")}</b><small>${m.uid === ((r.r.meta && r.r.meta.host) || r.r.host || "") ? "хозяин, " : ""}вошёл ${esc(ago(m.ts))}${r.r.voice && r.r.voice[m.uid] ? ", в голосовом" : ""}</small></div></li>`).join("") : `<li class="empty">В комнате пока никого нет.</li>`;
 }
 function renderChat(val){
   const box = $("#rdChat"), stick = box.scrollHeight - box.scrollTop - box.clientHeight < 40 || !box.dataset.init;
@@ -1298,7 +1307,7 @@ function init(){
   });
   $("#roomDrawer").addEventListener("click", e => {
     const c = e.target.closest("[data-ctl]");
-    if(c && ROOT && S.openRoom){ ROOT.child("rooms/" + S.openRoom + "/ctl").set(c.dataset.ctl).then(() => toast("Режим управления изменён"), err => toast(err.message, "err")); return; }
+    if(c && ROOT && S.openRoom){ ROOT.child("rooms/" + S.openRoom + "/meta/ctl").set(c.dataset.ctl).then(() => toast("Режим управления изменён"), err => toast(err.message, "err")); return; }
     const b = e.target.closest("[data-ract]"); if(b) roomAction(b.dataset.ract);
   });
   $("#rdForm").onsubmit = e => {

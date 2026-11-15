@@ -48,7 +48,8 @@ ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
 UTC_OFFSET = int(os.environ.get("ANALYTICS_UTC_OFFSET", "").strip() or 0)
 RETAIN_DAYS = int(os.environ.get("ANALYTICS_RETAIN_DAYS", "").strip() or 0)
 RTDB_URL = os.environ.get("FIREBASE_DB_URL", "").strip().rstrip("/")
-RTDB_ROOT = os.environ.get("FIREBASE_ROOT", "").strip().strip("/")
+RTDB_ROOT = os.environ.get("FIREBASE_ROOT", "kino88").strip().strip("/") or "kino88"
+FIREBASE_WEB_API_KEY = os.environ.get("FIREBASE_WEB_API_KEY", "").strip()
 ADMIN_HTML = os.path.join(BASE_DIR, "admin.html")
 
 bp = Blueprint("analytics", __name__)
@@ -282,8 +283,7 @@ def _authed():
     c = request.cookies.get("oc_admin", "")
     if c and _eq(c, _cookie_value()):
         return True
-    given = (request.headers.get("Authorization", "").replace("Bearer ", "")
-             or request.args.get("token") or "").strip()
+    given = request.headers.get("Authorization", "").replace("Bearer ", "").strip()
     return bool(given) and _eq(given, ADMIN_TOKEN)
 
 
@@ -468,9 +468,28 @@ def _admin_page():
             html = f.read()
     except OSError:
         return Response("admin.html не найден рядом с analytics.py", status=500, mimetype="text/plain")
-    cfg = json.dumps({"url": RTDB_URL, "root": RTDB_ROOT})
+    cfg = json.dumps({"url": RTDB_URL, "root": RTDB_ROOT, "apiKey": FIREBASE_WEB_API_KEY})
     html = html.replace("__ADMIN_CFG__", cfg.replace("<", "\\u003c"))
     return _nocache(Response(html, mimetype="text/html"))
+
+
+@bp.route("/admin/firebase-token")
+def admin_firebase_token():
+    if not _authed():
+        return ("Not found", 404)
+    if not FIREBASE_WEB_API_KEY or not RTDB_URL or not RTDB_ROOT:
+        response = jsonify({"ok": False, "error": "Firebase Auth is not configured"})
+        response.status_code = 503
+        return _nocache(response)
+    try:
+        from firebase_admin_support import create_custom_token
+
+        token = create_custom_token("onecinema-admin", {"admin": True})
+        return _nocache(jsonify({"ok": True, "token": token}))
+    except Exception as exc:
+        response = jsonify({"ok": False, "error": type(exc).__name__})
+        response.status_code = 503
+        return _nocache(response)
 
 
 @bp.route("/admin")
@@ -479,9 +498,6 @@ def _admin_page():
 def admin_index():
     if not ADMIN_TOKEN:
         return ("Not found", 404)
-    t = request.args.get("token")
-    if t and _eq(t.strip(), ADMIN_TOKEN):           # старые ссылки ?token=… — ставим куку и убираем токен из адреса
-        return _set_cookie(redirect("/admin"))
     if _authed():
         return _admin_page()
     return _nocache(Response(LOGIN_HTML.replace("__ERR__", ""), mimetype="text/html", status=200))

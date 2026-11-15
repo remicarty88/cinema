@@ -22,18 +22,27 @@
     RELAY_ORIGIN     - внешний релей видеопотока (Cloudflare Worker и т.п.); задан ->
                        плеер тянет видео мимо Railway (egress Railway ≈ 0), а /api/proxy
                        остаётся запасным путём при сбое релея. Пусто — только /api/proxy.
+    FIREBASE_WEB_API_KEY         - публичный Web API key для Firebase Auth клиента
+    FIREBASE_SERVICE_ACCOUNT_JSON - приватный JSON Service Account (только Railway)
+    FIREBASE_DB_URL              - URL Realtime Database
+    FIREBASE_ROOT                - корневой узел Realtime Database (по умолчанию kino88)
     PORT             - порт сервера (по умолчанию 8000)
     HOST             - адрес привязки (по умолчанию 0.0.0.0)
 
 Деплой (Railway): команда запуска в Procfile -> gunicorn server:app.
 """
 import io
+import base64
+import hashlib
+import hmac
 import json
 import os
 import random
 import re
+import secrets
 import time
 import threading
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse, urljoin, quote
 
@@ -144,8 +153,78 @@ VIDEO_DIRECT = (os.environ.get("VIDEO_DIRECT", "on").strip().lower() or "on")
 # Внешний релей потока (Cloudflare Worker и т.п.). Задан — браузер тянет видео
 # напрямую с релея, минуя Railway (egress ≈ 0); /api/proxy остаётся запасным путём.
 RELAY_ORIGIN = os.environ.get("RELAY_ORIGIN", "").strip().rstrip("/")
+FIREBASE_WEB_API_KEY = os.environ.get("FIREBASE_WEB_API_KEY", "").strip()
+FIREBASE_DB_URL = os.environ.get("FIREBASE_DB_URL", "").strip().rstrip("/")
+FIREBASE_ROOT = os.environ.get("FIREBASE_ROOT", "kino88").strip().strip("/") or "kino88"
 
 app = Flask(__name__, static_folder=None)
+app.config["MAX_CONTENT_LENGTH"] = 64 * 1024
+
+_auth_rate_lock = threading.Lock()
+_auth_rate = defaultdict(deque)
+
+
+def _auth_rate_limited():
+    """Small per-process brake for password endpoints."""
+    key = request.remote_addr or "unknown"
+    now = time.monotonic()
+    with _auth_rate_lock:
+        q = _auth_rate[key]
+        while q and now - q[0] > 60:
+            q.popleft()
+        if len(q) >= 30:
+            return True
+        q.append(now)
+        if len(_auth_rate) > 2048:
+            for old_key, old_q in list(_auth_rate.items()):
+                while old_q and now - old_q[0] > 60:
+                    old_q.popleft()
+                if not old_q:
+                    _auth_rate.pop(old_key, None)
+    return False
+
+
+def _auth_json_error(message, status):
+    response = jsonify({"ok": False, "error": message})
+    response.headers["Cache-Control"] = "no-store"
+    return response, status
+
+
+def _auth_login_value(value):
+    return bool(re.fullmatch(r"[a-z0-9_-]{3,20}", value or ""))
+
+
+def _password_record(password):
+    salt = secrets.token_bytes(16)
+    iterations = 150000
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations, 32)
+    return {
+        "salt": base64.b64encode(salt).decode("ascii"),
+        "hash": base64.b64encode(digest).decode("ascii"),
+        "it": iterations,
+    }
+
+
+def _password_matches(password, record):
+    try:
+        salt = base64.b64decode(record["salt"], validate=True)
+        expected = base64.b64decode(record["hash"], validate=True)
+        iterations = int(record.get("it") or 150000)
+        if len(salt) != 16 or len(expected) != 32 or not 100000 <= iterations <= 300000:
+            return False
+    except (KeyError, TypeError, ValueError):
+        return False
+    actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations, 32)
+    return hmac.compare_digest(actual, expected)
+
+
+def _firebase_auth_ready():
+    return bool(
+        FIREBASE_WEB_API_KEY
+        and FIREBASE_DB_URL
+        and FIREBASE_ROOT
+        and os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
+    )
 
 # собственная аналитика: /api/track (приём) и /admin/stats (дашборд, нужен ADMIN_TOKEN)
 try:
@@ -2409,6 +2488,92 @@ def api_qualities():
         return json_error(f"{type(e).__name__}: {e}")
 
 
+@app.route("/api/auth/register", methods=["POST"])
+def api_auth_register():
+    """Create a password account bound to the caller's anonymous Firebase UID."""
+    if not _firebase_auth_ready():
+        return _auth_json_error("Firebase Auth не настроен", 503)
+    if _auth_rate_limited():
+        return _auth_json_error("Слишком много попыток. Подождите минуту.", 429)
+
+    data = request.get_json(silent=True) or {}
+    login = str(data.get("login") or "").strip().lower()
+    password = data.get("password")
+    if not _auth_login_value(login):
+        return _auth_json_error("Логин: 3–20 символов, латиница, цифры, _ или -", 400)
+    if not isinstance(password, str) or not 6 <= len(password) <= 64:
+        return _auth_json_error("Пароль должен содержать от 6 до 64 символов", 400)
+
+    auth_header = request.headers.get("Authorization", "")
+    id_token = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else ""
+    if not id_token:
+        return _auth_json_error("Нужна анонимная Firebase-сессия", 401)
+
+    try:
+        from firebase_admin_support import create_custom_token, database_ref, verify_id_token
+
+        claims = verify_id_token(id_token)
+        provider = (claims.get("firebase") or {}).get("sign_in_provider")
+        uid = str(claims.get("uid") or claims.get("sub") or "")
+        if provider != "anonymous" or not uid or len(uid) > 128:
+            return _auth_json_error("Регистрация доступна из гостевого профиля", 403)
+
+        record = _password_record(password)
+        account = {
+            "uid": uid,
+            **record,
+            "ts": int(time.time() * 1000),
+        }
+        ref = database_ref("accounts/" + login)
+        result = ref.transaction(lambda current: account if current is None else current)
+        if result != account:
+            return _auth_json_error("Этот логин уже занят", 409)
+
+        token = create_custom_token(uid)
+        response = jsonify({"ok": True, "uid": uid, "login": login, "token": token})
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    except Exception as exc:
+        app.logger.warning("Firebase registration failed: %s", type(exc).__name__)
+        return _auth_json_error("Не удалось создать аккаунт. Проверьте настройку Firebase.", 503)
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def api_auth_login():
+    """Verify the legacy PBKDF2 record server-side and issue a Firebase custom token."""
+    if not _firebase_auth_ready():
+        return _auth_json_error("Firebase Auth не настроен", 503)
+    if _auth_rate_limited():
+        return _auth_json_error("Слишком много попыток. Подождите минуту.", 429)
+
+    data = request.get_json(silent=True) or {}
+    login = str(data.get("login") or "").strip().lower()
+    password = data.get("password")
+    if not _auth_login_value(login) or not isinstance(password, str) or not 6 <= len(password) <= 64:
+        return _auth_json_error("Неверный логин или пароль", 401)
+
+    try:
+        from firebase_admin_support import create_custom_token, database_ref
+
+        record = database_ref("accounts/" + login).get()
+        if not isinstance(record, dict):
+            hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), b"onecinema-login-dummy", 150000, 32)
+            return _auth_json_error("Неверный логин или пароль", 401)
+        if not _password_matches(password, record):
+            return _auth_json_error("Неверный логин или пароль", 401)
+        uid = str(record.get("uid") or "")
+        if not uid or len(uid) > 128:
+            return _auth_json_error("Неверный логин или пароль", 401)
+
+        token = create_custom_token(uid)
+        response = jsonify({"ok": True, "uid": uid, "login": login, "token": token})
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    except Exception as exc:
+        app.logger.warning("Firebase login failed: %s", type(exc).__name__)
+        return _auth_json_error("Не удалось войти. Проверьте настройку Firebase.", 503)
+
+
 @app.route("/api/config")
 def api_config():
     return jsonify({
@@ -2418,6 +2583,8 @@ def api_config():
         "proxy": bool(PROXY),
         "videoProxy": bool(VIDEO_PROXY),
         "relay": RELAY_ORIGIN,
+        "firebaseApiKey": FIREBASE_WEB_API_KEY,
+        "firebaseDatabaseURL": FIREBASE_DB_URL,
         "embedTransport": EMBED_TRANSPORT,
         "hdrezkaAuthorized": bool(get_hdrezka_cookies()),
     })
